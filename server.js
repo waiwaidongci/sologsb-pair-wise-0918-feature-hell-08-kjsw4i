@@ -39,7 +39,8 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  overshoots: []
 };
 
 const routes = [
@@ -66,7 +67,9 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf8"));
+  if (!Array.isArray(db.overshoots)) db.overshoots = [];
+  return db;
 }
 
 async function writeDb(data) {
@@ -126,14 +129,36 @@ function latestAdjustment(db, clockId) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
 }
 
+function activeOvershoot(db, clockId) {
+  return db.overshoots.find((item) => item.clockId === clockId && item.status === "pending_readjustment") || null;
+}
+
+// 统一的过冲状态视图，所有查询入口共用，保证三处一致
+function overshootView(db, clockId) {
+  const overshoot = activeOvershoot(db, clockId);
+  if (!overshoot) return null;
+  return {
+    id: overshoot.id,
+    status: overshoot.status,
+    adjustmentId: overshoot.adjustmentId,
+    triggeredRetestId: overshoot.triggeredRetestId,
+    previousDailyRateSeconds: overshoot.previousDailyRateSeconds,
+    currentDailyRateSeconds: overshoot.currentDailyRateSeconds,
+    detectedAt: overshoot.detectedAt
+  };
+}
+
 function clockSummary(db, clock) {
   const retest = latestRetest(db, clock.id);
   const adjustment = latestAdjustment(db, clock.id);
+  const overshoot = activeOvershoot(db, clock.id);
   return {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    // 过冲待重调期间合格一律失效
+    qualified: overshoot ? false : retest ? retest.qualified : false,
+    overshoot: overshootView(db, clock.id)
   };
 }
 
@@ -183,7 +208,17 @@ async function handle(req, res) {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const overshoots = db.overshoots.filter((item) => item.clockId === clock.id);
+    return send(res, 200, {
+      data: {
+        clock,
+        adjustments,
+        retests,
+        overshoots,
+        latestRetest: latestRetest(db, clock.id),
+        overshoot: overshootView(db, clock.id)
+      }
+    });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -201,17 +236,34 @@ async function handle(req, res) {
       createdAt: new Date().toISOString()
     };
     db.adjustments.push(adjustment);
+    // 登记新调校后解除待重调，过冲历史保留
+    const now = adjustment.createdAt;
+    for (const overshoot of db.overshoots) {
+      if (overshoot.clockId === clock.id && overshoot.status === "pending_readjustment") {
+        overshoot.status = "resolved";
+        overshoot.resolvedAt = now;
+        overshoot.resolvedByAdjustmentId = adjustment.id;
+      }
+    }
     await writeDb(db);
-    return send(res, 201, { data: adjustment });
+    return send(res, 201, { data: adjustment, clock: clockSummary(db, clock) });
   }
 
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
   if (retestMatch && req.method === "POST") {
     const clock = findClock(db, retestMatch[1]);
+    // 过冲待重调期间，复测一律拒绝且不落库，需先登记新调校
+    const pending = activeOvershoot(db, clock.id);
+    if (pending) {
+      return send(res, 409, {
+        error: "钟表已过冲（日差跨过零点），处于待重调状态，请先登记新的调校记录",
+        data: { overshoot: overshootView(db, clock.id) }
+      });
+    }
     const body = await parseBody(req);
     required(body, ["dailyRateSeconds", "amplitude"]);
     const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
-    const qualified = body.qualified !== undefined
+    let qualified = body.qualified !== undefined
       ? Boolean(body.qualified)
       : Math.abs(Number(body.dailyRateSeconds)) <= Number(clock.targetDailyRateSeconds);
     const retest = {
@@ -225,14 +277,47 @@ async function handle(req, res) {
       note: body.note || ""
     };
     db.retests.push(retest);
+
+    // 当前调校后的复测按实测时间取最近两条日差：前一条在一侧、后一条跨过零点到反向即过冲
+    const scopedRetests = db.retests
+      .filter((item) => item.clockId === clock.id && (!adjustmentId || item.adjustmentId === adjustmentId))
+      .sort((a, b) => new Date(a.testedAt) - new Date(b.testedAt));
+    const latestTwo = scopedRetests.slice(-2);
+    let overshoot = null;
+    if (latestTwo.length === 2 && latestTwo[0].dailyRateSeconds * latestTwo[1].dailyRateSeconds < 0) {
+      overshoot = {
+        id: makeId("overshoot"),
+        clockId: clock.id,
+        adjustmentId,
+        previousRetestId: latestTwo[0].id,
+        triggeredRetestId: retest.id,
+        previousDailyRateSeconds: latestTwo[0].dailyRateSeconds,
+        currentDailyRateSeconds: retest.dailyRateSeconds,
+        status: "pending_readjustment",
+        detectedAt: new Date().toISOString(),
+        resolvedAt: null,
+        resolvedByAdjustmentId: null
+      };
+      db.overshoots.push(overshoot);
+      // 触发过冲的复测合格立即失效
+      retest.qualified = false;
+      qualified = false;
+    }
+
     await writeDb(db);
-    return send(res, 201, { data: retest, clock: clockSummary(db, clock) });
+    return send(res, 201, { data: retest, clock: clockSummary(db, clock), overshoot: overshootView(db, clock.id) });
   }
 
   const latestMatch = pathname.match(/^\/clocks\/([^/]+)\/latest-retest$/);
   if (latestMatch && req.method === "GET") {
-    findClock(db, latestMatch[1]);
-    return send(res, 200, { data: latestRetest(db, latestMatch[1]) });
+    const clock = findClock(db, latestMatch[1]);
+    const retest = latestRetest(db, clock.id);
+    const overshoot = overshootView(db, clock.id);
+    return send(res, 200, {
+      data: retest,
+      qualified: retest && !overshoot ? retest.qualified : false,
+      overshoot
+    });
   }
 
   if (req.method === "GET" && pathname === "/adjustments") {
