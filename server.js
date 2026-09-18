@@ -39,7 +39,8 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  overshoots: []
 };
 
 const routes = [
@@ -66,7 +67,9 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const data = JSON.parse(await readFile(DB_FILE, "utf8"));
+  if (!Array.isArray(data.overshoots)) data.overshoots = [];
+  return data;
 }
 
 async function writeDb(data) {
@@ -126,14 +129,37 @@ function latestAdjustment(db, clockId) {
     .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
 }
 
+function activeOvershoot(db, clockId) {
+  return db.overshoots.find((item) => item.clockId === clockId && !item.resolvedAt) || null;
+}
+
+function overshootStatus(db, clockId) {
+  const event = activeOvershoot(db, clockId);
+  return { active: Boolean(event), event };
+}
+
+function currentCycleRetests(db, clockId) {
+  const adjustment = latestAdjustment(db, clockId);
+  const since = adjustment ? new Date(adjustment.createdAt).getTime() : -Infinity;
+  return db.retests
+    .filter((item) => item.clockId === clockId && new Date(item.testedAt).getTime() >= since)
+    .sort((a, b) => new Date(a.testedAt) - new Date(b.testedAt));
+}
+
+function crossesZero(previousRate, currentRate) {
+  return (previousRate > 0 && currentRate < 0) || (previousRate < 0 && currentRate > 0);
+}
+
 function clockSummary(db, clock) {
   const retest = latestRetest(db, clock.id);
   const adjustment = latestAdjustment(db, clock.id);
+  const overshoot = overshootStatus(db, clock.id);
   return {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    qualified: !overshoot.active && (retest ? retest.qualified : false),
+    overshoot
   };
 }
 
@@ -183,7 +209,16 @@ async function handle(req, res) {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    return send(res, 200, {
+      data: {
+        clock,
+        adjustments,
+        retests,
+        latestRetest: latestRetest(db, clock.id),
+        overshoot: overshootStatus(db, clock.id),
+        overshoots: db.overshoots.filter((item) => item.clockId === clock.id)
+      }
+    });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -201,13 +236,26 @@ async function handle(req, res) {
       createdAt: new Date().toISOString()
     };
     db.adjustments.push(adjustment);
+    // 登记新调校即解除过冲待重调状态，过冲事件保留在历史中
+    const pending = activeOvershoot(db, clock.id);
+    if (pending) {
+      pending.resolvedAt = adjustment.createdAt;
+      pending.resolvedByAdjustmentId = adjustment.id;
+    }
     await writeDb(db);
-    return send(res, 201, { data: adjustment });
+    return send(res, 201, { data: adjustment, overshoot: overshootStatus(db, clock.id) });
   }
 
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
   if (retestMatch && req.method === "POST") {
     const clock = findClock(db, retestMatch[1]);
+    const pending = activeOvershoot(db, clock.id);
+    if (pending) {
+      return send(res, 409, {
+        error: "钟表处于过冲待重调状态，请先登记新调校",
+        overshoot: overshootStatus(db, clock.id)
+      });
+    }
     const body = await parseBody(req);
     required(body, ["dailyRateSeconds", "amplitude"]);
     const adjustmentId = body.adjustmentId || latestAdjustment(db, clock.id)?.id || null;
@@ -225,14 +273,33 @@ async function handle(req, res) {
       note: body.note || ""
     };
     db.retests.push(retest);
+    // 过冲检测：当前调校周期内按实测时间取最近两条日差，前一条在一侧、后一条跨过零点到反向即触发
+    const cycle = currentCycleRetests(db, clock.id);
+    if (cycle.length >= 2 && cycle[cycle.length - 1].id === retest.id) {
+      const previous = cycle[cycle.length - 2];
+      if (crossesZero(previous.dailyRateSeconds, retest.dailyRateSeconds)) {
+        db.overshoots.push({
+          id: makeId("overshoot"),
+          clockId: clock.id,
+          adjustmentId: latestAdjustment(db, clock.id)?.id || null,
+          previousRetestId: previous.id,
+          triggerRetestId: retest.id,
+          previousDailyRateSeconds: previous.dailyRateSeconds,
+          triggerDailyRateSeconds: retest.dailyRateSeconds,
+          detectedAt: new Date().toISOString(),
+          resolvedAt: null,
+          resolvedByAdjustmentId: null
+        });
+      }
+    }
     await writeDb(db);
-    return send(res, 201, { data: retest, clock: clockSummary(db, clock) });
+    return send(res, 201, { data: retest, clock: clockSummary(db, clock), overshoot: overshootStatus(db, clock.id) });
   }
 
   const latestMatch = pathname.match(/^\/clocks\/([^/]+)\/latest-retest$/);
   if (latestMatch && req.method === "GET") {
-    findClock(db, latestMatch[1]);
-    return send(res, 200, { data: latestRetest(db, latestMatch[1]) });
+    const clock = findClock(db, latestMatch[1]);
+    return send(res, 200, { data: latestRetest(db, clock.id), overshoot: overshootStatus(db, clock.id) });
   }
 
   if (req.method === "GET" && pathname === "/adjustments") {

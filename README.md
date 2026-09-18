@@ -21,6 +21,18 @@ PORT=3021 node server.js
 - `GET /adjustments?clockId=`
 - `GET /retests?clockId=&qualified=`
 
+## 过冲保护
+
+复测落库后，取当前调校周期内（实测时间不早于最近一次调校）按实测时间排序的最近两条日差：
+前一条在一侧、后一条跨过零点到反向（一正一负，0 不算任一侧）时，钟表立即进入**过冲待重调**状态：
+
+- 合格状态失效（`qualified` 强制为 `false`，自动进入 `/clocks/not-qualified`）
+- 后续复测返回 `409` 且不落库
+- 登记新调校后状态解除，过冲事件保留在 `overshoots` 历史中
+
+`GET /clocks`、`GET /clocks/:id/history`、`GET /clocks/:id/latest-retest` 三个查询入口均返回一致的
+`overshoot` 状态（`{ active, event }`）；history 接口额外返回完整 `overshoots` 历史列表。
+
 ## 闭环示例
 
 ```bash
